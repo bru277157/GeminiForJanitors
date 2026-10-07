@@ -1,3 +1,4 @@
+import time
 from typing import Any
 
 import httpx2
@@ -78,6 +79,54 @@ def _get_quota_violation_feedback(qid: str) -> str | None:
     return None
 
 
+# If the main model is overloaded, fall back to this one
+FALLBACK_MODELS = {
+    "gemini-3.5-flash": "gemini-3.5-flash-lite",
+}
+
+# Error codes that mean "Google is busy, try again"
+RETRY_STATUS_CODES = {500, 503}
+
+# Seconds to wait between retries
+MAIN_RETRY_DELAYS = (1.5, 3.0)
+FALLBACK_RETRY_DELAYS = (2.0,)
+
+
+def _post_with_retry(
+    user: XUID,
+    api_key: str,
+    model: str,
+    gemini_request: dict[str, Any],
+):
+    """Sends the request to Google, retrying if Google is overloaded and
+    falling back to another model if it stays overloaded."""
+
+    plan = [(model, MAIN_RETRY_DELAYS)]
+    if fallback := FALLBACK_MODELS.get(model):
+        plan.append((fallback, FALLBACK_RETRY_DELAYS))
+
+    response = None
+    for current_model, delays in plan:
+        for attempt in range(len(delays) + 1):
+            response = http_client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent",
+                headers={"x-goog-api-key": api_key},
+                json=gemini_request,
+                timeout=PROCESS_TIMEOUT,
+            )
+            if response.status_code not in RETRY_STATUS_CODES:
+                return response
+            xlog(
+                user,
+                f"{current_model} returned {response.status_code} "
+                f"(attempt {attempt + 1})",
+            )
+            if attempt < len(delays):
+                time.sleep(delays[attempt])
+
+    return response
+
+
 def gemini_generate_content(
     user: XUID,
     api_key: str,
@@ -142,12 +191,7 @@ def gemini_generate_content(
             gemini_request["tools"] = [{"googleSearch": {}}]
 
     try:
-        response = http_client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            headers={"x-goog-api-key": api_key},
-            json=gemini_request,
-            timeout=PROCESS_TIMEOUT,
-        )
+        response = _post_with_retry(user, api_key, model, gemini_request)
         response.raise_for_status()
         gemini_result = response.json()
     except httpx2.TimeoutException:
