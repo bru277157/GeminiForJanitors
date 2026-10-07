@@ -79,17 +79,18 @@ def _get_quota_violation_feedback(qid: str) -> str | None:
     return None
 
 
-# If the main model is overloaded, fall back to this one
+# If the main model keeps failing, try these models in order
 FALLBACK_MODELS = {
-    "gemini-3.5-flash": "gemini-3.5-flash-lite",
+    "gemini-3.5-flash": [
+        "gemini-3.5-flash-lite",
+    ],
 }
 
 # Error codes that mean "Google is busy, try again"
 RETRY_STATUS_CODES = {500, 503}
 
-# Seconds to wait between retries
-MAIN_RETRY_DELAYS = (1.5, 3.0)
-FALLBACK_RETRY_DELAYS = (2.0,)
+# Seconds to wait between retries of the main model
+MAIN_RETRY_DELAYS = (1.5,)
 
 
 def _post_with_retry(
@@ -98,33 +99,49 @@ def _post_with_retry(
     model: str,
     gemini_request: dict[str, Any],
 ):
-    """Sends the request to Google, retrying if Google is overloaded and
-    falling back to another model if it stays overloaded."""
+    """Sends the request to Google. If the main model is overloaded, retries it
+    and then tries the fallback models one by one. Every step is logged."""
 
-    plan = [(model, MAIN_RETRY_DELAYS)]
-    if fallback := FALLBACK_MODELS.get(model):
-        plan.append((fallback, FALLBACK_RETRY_DELAYS))
+    models = [model] + FALLBACK_MODELS.get(model, [])
+    main_response = None
 
-    response = None
-    for current_model, delays in plan:
+    for index, current_model in enumerate(models):
+        delays = MAIN_RETRY_DELAYS if index == 0 else ()
+
         for attempt in range(len(delays) + 1):
-            response = http_client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent",
-                headers={"x-goog-api-key": api_key},
-                json=gemini_request,
-                timeout=PROCESS_TIMEOUT,
-            )
-            if response.status_code not in RETRY_STATUS_CODES:
+            xlog(user, f"Trying {current_model} (attempt {attempt + 1})")
+
+            try:
+                response = http_client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent",
+                    headers={"x-goog-api-key": api_key},
+                    json=gemini_request,
+                    timeout=PROCESS_TIMEOUT,
+                )
+            except httpx2.TimeoutException:
+                xlog(user, f"{current_model} timed out")
+                if index == 0:
+                    raise
+                break
+
+            xlog(user, f"{current_model} returned {response.status_code}")
+
+            if index == 0:
+                main_response = response
+                if response.status_code not in RETRY_STATUS_CODES:
+                    return response
+            elif 200 <= response.status_code < 300:
+                xlog(user, f"Using fallback model {current_model}")
                 return response
-            xlog(
-                user,
-                f"{current_model} returned {response.status_code} "
-                f"(attempt {attempt + 1})",
-            )
+
             if attempt < len(delays):
                 time.sleep(delays[attempt])
 
-    return response
+        if index + 1 < len(models):
+            xlog(user, f"Moving on to {models[index + 1]}")
+
+    xlog(user, "All models failed")
+    return main_response
 
 
 def gemini_generate_content(
